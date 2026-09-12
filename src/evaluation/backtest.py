@@ -181,6 +181,66 @@ def backtest_volatility(
 
     return pd.DataFrame(rows)
 
+def backtest_lstm_volatility(
+    returns_series,
+    initial_train_size,
+    horizon=5,
+    step=20,
+    lookback=20,
+    epochs=50,
+):
+    """
+    Walk-forward backtest for the LSTM volatility model, kept as a
+    separate function from backtest_volatility rather than folded in as
+    another `include_*` flag -- LSTM training is dramatically slower than
+    GARCH-family fitting (tens of seconds vs. a fraction of a second per
+    window), so it's kept independent to run on its own schedule instead
+    of always re-training alongside the fast models.
+    """
+    from src.models.volatility.lstm_volatility import (
+        fit_lstm_volatility,
+        forecast_lstm_volatility,
+    )
+
+    returns_series = returns_series.reset_index(drop=True)
+    rows = []
+
+    for train_start, train_end, test_end in walk_forward_windows(
+        len(returns_series), initial_train_size, horizon, step
+    ):
+        train = returns_series.iloc[train_start:train_end]
+        actual_returns = returns_series.iloc[train_end:test_end].values
+
+        try:
+            model, lb = fit_lstm_volatility(
+                train, lookback=lookback, epochs=epochs, verbose=0
+            )
+            lstm_vol = forecast_lstm_volatility(
+                model, train, lb, horizon=horizon
+            ).values
+        except Exception as exc:  # noqa: BLE001
+            print(f"[backtest_lstm_volatility] window ending at {train_end} failed: {exc}")
+            continue
+
+        hist_vol = historical_volatility_forecast(train, steps=horizon).values
+
+        lstm_m = volatility_metrics(actual_returns, lstm_vol)
+        hist_m = volatility_metrics(actual_returns, hist_vol)
+
+        rows.append({
+            "window_end": train_end,
+            "lstm_rmse": lstm_m["rmse_vol"],
+            "lstm_mae": lstm_m["mae_vol"],
+            "lstm_qlike": lstm_m["qlike"],
+            "hist_vol_rmse": hist_m["rmse_vol"],
+            "hist_vol_mae": hist_m["mae_vol"],
+            "hist_vol_qlike": hist_m["qlike"],
+        })
+        print(f"  window ending at {train_end} done "
+              f"(lstm_qlike={lstm_m['qlike']:.4f}, hist_vol_qlike={hist_m['qlike']:.4f})")
+
+    return pd.DataFrame(rows)
+
 
 def summarize_backtest(results_df, model_a_col, model_b_col, lower_is_better=True):
     """
